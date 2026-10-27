@@ -257,9 +257,11 @@ IDs containing `gemini` (which do not select the native Google SDK).
 
 `--api-key` overrides `API_ROUTE_API_KEY`; other providers' environment keys are
 never used. Do not combine `--api-route` with another provider flag, `--litellm`,
-or `--api-base`. API Route requests are not automatically retried, including
-timeouts, connection errors and rate limits, to avoid duplicating billable
-generation requests.
+or `--api-base`. API Route uses the shared `LLMClient` retry policy for timeouts,
+connection errors and rate limits. SDK-level retries remain disabled so retries
+are controlled by the benchmark client rather than stacked across both layers.
+This is client-side behavior, not a guarantee of provider-side idempotency or
+billing behavior.
 
 ## MiniMax readers
 

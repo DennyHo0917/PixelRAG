@@ -1,10 +1,12 @@
 """Offline coverage of the optional API Route evaluation reader."""
 
+import ast
 import asyncio
 import sys
 import types
 from pathlib import Path
 from runpy import run_path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -46,21 +48,35 @@ def test_api_route_requires_own_key(monkeypatch, key):
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "failures", "expected_calls"),
     [
-        None,
-        asyncio.TimeoutError(),
-        RuntimeError("Connection error"),
-        RuntimeError("429"),
+        pytest.param(None, 0, 1, id="success"),
+        pytest.param(asyncio.TimeoutError(), 1, 2, id="timeout-recovery"),
+        pytest.param(
+            RuntimeError("Request timed out"), 1, 2, id="sdk-timeout-recovery"
+        ),
+        pytest.param(RuntimeError("Connection error"), 1, 2, id="connection-recovery"),
+        pytest.param(RuntimeError("429"), 1, 2, id="rate-limit-recovery"),
+        pytest.param(asyncio.TimeoutError(), 3, 3, id="timeout-limit"),
+        pytest.param(RuntimeError("Connection error"), 12, 12, id="connection-limit"),
+        pytest.param(RuntimeError("429"), 6, 6, id="rate-limit-limit"),
+        pytest.param(RuntimeError("400 bad request"), 1, 1, id="nonretryable-error"),
+        pytest.param(
+            RuntimeError("500 internal server error"), 1, 1, id="no-sdk-retry"
+        ),
     ],
 )
-def test_api_route_client_routes_once(monkeypatch, error):
+def test_api_route_client_uses_shared_retries(
+    monkeypatch, error, failures, expected_calls
+):
     calls = []
     options = {}
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
 
     async def create(**kwargs):
         calls.append(kwargs)
-        if error is not None:
+        if error is not None and len(calls) <= failures:
             raise error
         return types.SimpleNamespace(
             choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="4"))],
@@ -81,7 +97,6 @@ def test_api_route_client_routes_once(monkeypatch, error):
     client = LLMClient(
         **get_config("google/gemini-fixture", "api-route-test-key"),
         force_openai_compat=True,
-        retry_requests=False,
         max_tokens=64,
     )
     messages = [
@@ -96,17 +111,42 @@ def test_api_route_client_routes_once(monkeypatch, error):
             ],
         }
     ]
-    if error is None:
+    if failures < expected_calls:
         text, usage = asyncio.run(client.generate(messages))
         assert text == "4"
         assert usage["total_tokens"] == 4
     else:
         with pytest.raises(type(error)):
             asyncio.run(client.generate(messages))
-    assert len(calls) == 1
-    assert calls[0]["model"] == "google/gemini-fixture"
-    assert calls[0]["messages"] == messages
+    assert len(calls) == expected_calls
+    assert sleep.await_count == expected_calls - 1
+    assert all(call["model"] == "google/gemini-fixture" for call in calls)
+    assert all(call["messages"] == messages for call in calls)
     assert options["base_url"] == "https://global.api-route.com/v1"
     assert options["api_key"] == "api-route-test-key"
     assert options["max_retries"] == 0
+    assert client.retry_requests
     assert not client.is_gemini
+
+
+@pytest.mark.parametrize(
+    ("api_route", "atlascloud", "expected"),
+    [(False, False, True), (True, False, True), (False, True, False)],
+)
+def test_cli_retry_policy(api_route, atlascloud, expected):
+    # Check the actual CLI wiring without importing the dataset/benchmark stack.
+    source = (_LIB.parent / "run_bench.py").read_text()
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "LLMClient"
+    ]
+    assert len(calls) == 1
+    retry = next(kw.value for kw in calls[0].keywords if kw.arg == "retry_requests")
+    args = types.SimpleNamespace(api_route=api_route, atlascloud=atlascloud)
+    assert (
+        eval(compile(ast.Expression(retry), "run_bench.py", "eval"), {"args": args})
+        is expected
+    )

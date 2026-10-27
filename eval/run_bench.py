@@ -1173,7 +1173,8 @@ async def run_async(args):
             or args.api_route
         ),
         use_litellm=args.litellm,
-        retry_requests=not (args.atlascloud or args.api_route),
+        # API Route uses the shared retry policy; preserve Atlas Cloud's existing opt-out.
+        retry_requests=not args.atlascloud,
     )
 
     # 3b. Create pixel-compressed encoder for generation if requested
